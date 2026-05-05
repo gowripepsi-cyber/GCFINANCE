@@ -131,6 +131,24 @@ def initialize_db():
         cursor.execute("ALTER TABLE customers ADD COLUMN aadhar_image_path TEXT")
     except:
         pass # Column already exists
+
+    try:
+        cursor.execute("ALTER TABLE customers ADD COLUMN batch_id INTEGER")
+    except:
+        pass
+
+    # 6b. Chit Batches
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS chit_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_name TEXT UNIQUE NOT NULL,
+        chit_value REAL NOT NULL,
+        starting_date TEXT,
+        status TEXT DEFAULT 'Active',
+        account_id INTEGER,
+        FOREIGN KEY(account_id) REFERENCES accounts(id)
+    )
+    """)
     
     # 5. Customer Ledgers (Tracks payments per month per batch)
     cursor.execute("""
@@ -238,18 +256,6 @@ def initialize_db():
     )
     """)
 
-    # 6b. Chit Batches
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS chit_batches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        batch_name TEXT UNIQUE NOT NULL,
-        chit_value REAL NOT NULL,
-        starting_date TEXT,
-        status TEXT DEFAULT 'Active',
-        account_id INTEGER,
-        FOREIGN KEY(account_id) REFERENCES accounts(id)
-    )
-    """)
 
     # Migration for shg_groups
     try:
@@ -267,11 +273,6 @@ def initialize_db():
     except:
         pass
 
-    # Migration for customers
-    try:
-        cursor.execute("ALTER TABLE customers ADD COLUMN batch_id INTEGER")
-    except:
-        pass
 
     # Migration for chit_batches (account_id)
     try:
