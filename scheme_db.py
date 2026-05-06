@@ -110,11 +110,13 @@ def initialize_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         cif_number TEXT UNIQUE NOT NULL,
         name TEXT NOT NULL,
+        surname TEXT,
         phone TEXT,
         address TEXT,
         join_date TEXT NOT NULL,
         aadhar_number TEXT NOT NULL,
         aadhar_image_path TEXT,
+        photo_path TEXT,
         withdrawn_month INTEGER, -- NULL if not withdrawn
         status TEXT DEFAULT 'Active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -128,7 +130,17 @@ def initialize_db():
         pass # Column already exists
         
     try:
+        cursor.execute("ALTER TABLE customers ADD COLUMN surname TEXT")
+    except:
+        pass # Column already exists
+        
+    try:
         cursor.execute("ALTER TABLE customers ADD COLUMN aadhar_image_path TEXT")
+    except:
+        pass # Column already exists
+        
+    try:
+        cursor.execute("ALTER TABLE customers ADD COLUMN photo_path TEXT")
     except:
         pass # Column already exists
 
@@ -157,6 +169,7 @@ def initialize_db():
         customer_id INTEGER,
         batch_id INTEGER,
         month_number INTEGER NOT NULL,
+        due_date TEXT,
         due_amount REAL NOT NULL,
         paid_amount REAL DEFAULT 0,
         payment_date TEXT,
@@ -200,6 +213,12 @@ def initialize_db():
             JOIN customers c ON l.customer_id = c.id
         """)
         cursor.execute("DROP TABLE customer_ledgers_old")
+
+    # 5a.1 Migration for customer_ledgers due_date
+    try:
+        cursor.execute("ALTER TABLE customer_ledgers ADD COLUMN due_date TEXT")
+    except:
+        pass
 
     # 5b. Batch Enrollments (Linking CIFs to multiple batches)
     cursor.execute("""
