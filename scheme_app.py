@@ -15,6 +15,8 @@ from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 
 import scheme_db
 import calendar
+import json
+import backup_restore
 
 def calculate_due_date(start_date_str, month_offset):
     try:
@@ -1473,6 +1475,7 @@ class SchemeFinanceApp(QMainWindow):
         self.nav_list.addItem("Accounting")
         self.nav_list.addItem("Batches")
         self.nav_list.addItem("Scheme Config")
+        self.nav_list.addItem("Backup & Restore")
         
         self.nav_list.currentRowChanged.connect(self.change_page)
         sidebar_layout.addWidget(self.nav_list, 9) # Give 90% relative stretch to the list
@@ -1531,6 +1534,9 @@ class SchemeFinanceApp(QMainWindow):
         self.page_config = QWidget()
         self.setup_scheme_master_tab()
         
+        self.page_backup = QWidget()
+        self.setup_backup_restore_tab()
+        
         self.stacked_widget.addWidget(self.page_dashboard)    # 0
         self.stacked_widget.addWidget(self.page_customers)    # 1
         self.stacked_widget.addWidget(self.page_chit)         # 2
@@ -1539,6 +1545,7 @@ class SchemeFinanceApp(QMainWindow):
         self.stacked_widget.addWidget(self.page_accounting)   # 5
         self.stacked_widget.addWidget(self.page_batches)      # 6
         self.stacked_widget.addWidget(self.page_config)       # 7
+        self.stacked_widget.addWidget(self.page_backup)       # 8
         
         self.nav_list.setCurrentRow(0)
 
@@ -2277,7 +2284,20 @@ class SchemeFinanceApp(QMainWindow):
             
             close_btn = QPushButton("Close")
             close_btn.clicked.connect(dialog.accept)
-            close_btn.setStyleSheet("padding: 8px 24px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; font-weight: bold;")
+            close_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #dc3545;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    font-weight: bold;
+                    padding: 8px 18px;
+                }
+                QPushButton:hover {
+                    background-color: #b52a37;
+                }
+            """)
+            close_btn.setCursor(Qt.PointingHandCursor)
             
             btn_layout.addWidget(print_btn)
             btn_layout.addWidget(close_btn)
@@ -3094,6 +3114,213 @@ class SchemeFinanceApp(QMainWindow):
                 self.load_transactions()
             finally:
                 conn.close()
+
+    # --- Backup & Restore Methods ---
+    def setup_backup_restore_tab(self):
+        layout = QVBoxLayout(self.page_backup)
+        
+        # Email Settings Group
+        settings_frame = QFrame()
+        settings_frame.setStyleSheet("background-color: white; border-radius: 8px;")
+        settings_layout = QFormLayout(settings_frame)
+        settings_layout.setContentsMargins(15, 15, 15, 15)
+        
+        lbl_title = QLabel("Email Settings for Backup")
+        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #333;")
+        settings_layout.addRow(lbl_title)
+        
+        self.email_sender_input = QLineEdit()
+        self.email_sender_input.setPlaceholderText("sender@gmail.com")
+        self.email_password_input = QLineEdit()
+        self.email_password_input.setEchoMode(QLineEdit.Password)
+        self.email_password_input.setPlaceholderText("App Password")
+        self.email_receiver_input = QLineEdit()
+        self.email_receiver_input.setPlaceholderText("receiver@gmail.com")
+        self.smtp_server_input = QLineEdit()
+        self.smtp_server_input.setText("smtp.gmail.com")
+        self.smtp_port_input = QLineEdit()
+        self.smtp_port_input.setText("465")
+        
+        settings_layout.addRow("Sender Email:", self.email_sender_input)
+        settings_layout.addRow("App Password:", self.email_password_input)
+        settings_layout.addRow("Receiver Email:", self.email_receiver_input)
+        settings_layout.addRow("SMTP Server:", self.smtp_server_input)
+        settings_layout.addRow("SMTP Port:", self.smtp_port_input)
+        
+        self.btn_save_email = QPushButton("Save Settings")
+        self.btn_save_email.setFixedWidth(150)
+        self.btn_save_email.clicked.connect(self.save_email_config)
+        self.btn_save_email.setStyleSheet("padding: 8px; background-color: #2196f3; color: white; border-radius: 4px; font-weight: bold;")
+        settings_layout.addRow("", self.btn_save_email)
+        
+        layout.addWidget(settings_frame)
+        
+        # Actions Group
+        actions_layout = QHBoxLayout()
+        self.btn_backup = QPushButton("Backup & Send Mail")
+        self.btn_backup.setStyleSheet("padding: 15px; background-color: #4caf50; color: white; border-radius: 6px; font-weight: bold; font-size: 14px;")
+        self.btn_backup.clicked.connect(self.run_backup)
+        
+        self.btn_restore = QPushButton("Restore Backup")
+        self.btn_restore.setStyleSheet("padding: 15px; background-color: #f44336; color: white; border-radius: 6px; font-weight: bold; font-size: 14px;")
+        self.btn_restore.clicked.connect(self.run_restore)
+        
+        actions_layout.addWidget(self.btn_backup)
+        actions_layout.addWidget(self.btn_restore)
+        layout.addLayout(actions_layout)
+        
+        # Status Label
+        self.backup_status_label = QLabel("")
+        self.backup_status_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.backup_status_label)
+        
+        # History Table
+        history_lbl = QLabel("Backup History (Local)")
+        history_lbl.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 10px;")
+        layout.addWidget(history_lbl)
+        
+        self.backup_history_table = QTableWidget()
+        self.backup_history_table.setColumnCount(4)
+        self.backup_history_table.setHorizontalHeaderLabels(["File Name", "Date", "Size (KB)", "Status"])
+        self.backup_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.backup_history_table)
+        
+        self.load_email_config()
+        self.load_backup_history()
+
+    def load_email_config(self):
+        config_path = "config.json"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    self.email_sender_input.setText(config.get("sender_email", ""))
+                    # Simple obfuscation decode
+                    import base64
+                    encoded_pwd = config.get("app_password", "")
+                    if encoded_pwd:
+                        try:
+                            self.email_password_input.setText(base64.b64decode(encoded_pwd).decode('utf-8'))
+                        except:
+                            self.email_password_input.setText(encoded_pwd)
+                    self.email_receiver_input.setText(config.get("receiver_email", ""))
+                    self.smtp_server_input.setText(config.get("smtp_server", "smtp.gmail.com"))
+                    self.smtp_port_input.setText(config.get("smtp_port", "465"))
+            except Exception as e:
+                print(f"Error loading config: {e}")
+
+    def save_email_config(self):
+        import base64
+        config = {
+            "sender_email": self.email_sender_input.text().strip(),
+            "app_password": base64.b64encode(self.email_password_input.text().encode('utf-8')).decode('utf-8'),
+            "receiver_email": self.email_receiver_input.text().strip(),
+            "smtp_server": self.smtp_server_input.text().strip(),
+            "smtp_port": self.smtp_port_input.text().strip()
+        }
+        with open("config.json", "w") as f:
+            json.dump(config, f)
+        QMessageBox.information(self, "Success", "Email settings saved securely.")
+
+    def run_backup(self):
+        self.save_email_config() # Auto save before run
+        config_path = "config.json"
+        config = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                import base64
+                if config.get("app_password"):
+                    try:
+                        config["app_password"] = base64.b64decode(config["app_password"]).decode('utf-8')
+                    except:
+                        pass
+                        
+        self.btn_backup.setEnabled(False)
+        self.backup_status_label.setText("Starting backup...")
+        
+        self.backup_worker = backup_restore.BackupWorker("scheme_finance.db", "backups", config)
+        self.backup_worker.progress.connect(self.on_backup_progress)
+        self.backup_worker.success.connect(self.on_backup_success)
+        self.backup_worker.error.connect(self.on_backup_error)
+        self.backup_worker.start()
+
+    def on_backup_progress(self, msg):
+        self.backup_status_label.setText(msg)
+
+    def on_backup_success(self, msg):
+        self.backup_status_label.setText("")
+        self.btn_backup.setEnabled(True)
+        QMessageBox.information(self, "Backup Complete", msg)
+        self.load_backup_history()
+
+    def on_backup_error(self, msg):
+        self.backup_status_label.setText("")
+        self.btn_backup.setEnabled(True)
+        QMessageBox.critical(self, "Backup Error", msg)
+        self.load_backup_history()
+
+    def run_restore(self):
+        reply = QMessageBox.question(self, 'Confirm Restore', 
+                                     "Current database will be replaced. A safety backup will be created.\\nDo you want to continue?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Backup File", "backups", "Backup Files (*.db *.zip)")
+        if not file_path:
+            return
+
+        self.btn_restore.setEnabled(False)
+        self.backup_status_label.setText("Restoring database...")
+        
+        self.restore_worker = backup_restore.RestoreWorker(file_path, "scheme_finance.db")
+        self.restore_worker.progress.connect(self.on_backup_progress)
+        self.restore_worker.success.connect(self.on_restore_success)
+        self.restore_worker.error.connect(self.on_backup_error) # reuse error handler
+        self.restore_worker.start()
+
+    def on_restore_success(self, msg):
+        self.backup_status_label.setText("")
+        self.btn_restore.setEnabled(True)
+        QMessageBox.information(self, "Restore Complete", msg)
+        self.reload_all_data()
+
+    def reload_all_data(self):
+        try:
+            self.load_dashboard_data()
+            self.load_customers()
+            self.load_chit_data()
+            self.load_shg_data()
+            self.load_individual_data()
+            self.load_batches()
+            self.load_accounts()
+        except Exception as e:
+            QMessageBox.warning(self, "Reload Error", f"Data reloaded with some errors: {e}")
+
+    def load_backup_history(self):
+        self.backup_history_table.setRowCount(0)
+        backup_dir = "backups"
+        if not os.path.exists(backup_dir):
+            return
+            
+        files = []
+        for f in os.listdir(backup_dir):
+            if f.endswith(".db") or f.endswith(".zip"):
+                path = os.path.join(backup_dir, f)
+                stat = os.stat(path)
+                size_kb = stat.st_size / 1024
+                date_str = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                files.append((f, date_str, size_kb, "Available"))
+                
+        files.sort(key=lambda x: x[1], reverse=True) # Sort newest first
+        
+        for r_idx, (fname, fdate, fsize, fstatus) in enumerate(files):
+            self.backup_history_table.insertRow(r_idx)
+            self.backup_history_table.setItem(r_idx, 0, QTableWidgetItem(fname))
+            self.backup_history_table.setItem(r_idx, 1, QTableWidgetItem(fdate))
+            self.backup_history_table.setItem(r_idx, 2, QTableWidgetItem(f"{fsize:.1f}"))
+            self.backup_history_table.setItem(r_idx, 3, QTableWidgetItem(fstatus))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
