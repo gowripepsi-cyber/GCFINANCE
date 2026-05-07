@@ -8,32 +8,205 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QDialog, QFormLayout, QLineEdit, QComboBox, 
                                QMessageBox, QDoubleSpinBox, QDateEdit, QFileDialog,
                                QStackedWidget, QFrame, QListWidget, QListWidgetItem,
-                               QGraphicsDropShadowEffect, QTreeWidget, QTreeWidgetItem)
-from PySide6.QtCore import Qt, QDate, QSize
-from PySide6.QtGui import QFont, QColor, QIcon, QPixmap
+                               QGraphicsDropShadowEffect, QTreeWidget, QTreeWidgetItem, QTextEdit, QTextBrowser)
+from PySide6.QtCore import Qt, QDate, QSize, QTimer, QDateTime, QUrl
+from PySide6.QtGui import QFont, QColor, QIcon, QPixmap, QPainter, QPainterPath, QBrush, QPen, QImage, QDragEnterEvent, QDropEvent
+from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 
 import scheme_db
+import calendar
+import json
+import backup_restore
+
+def calculate_due_date(start_date_str, month_offset):
+    try:
+        if not start_date_str: return ""
+        parts = start_date_str.split('-')
+        if len(parts) != 3: return start_date_str
+        year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+        
+        month += month_offset
+        year += (month - 1) // 12
+        month = (month - 1) % 12 + 1
+        
+        last_day = calendar.monthrange(year, month)[1]
+        day = min(day, last_day)
+        
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    except Exception as e:
+        print(f"Error calculating due date: {e}")
+        return start_date_str
+
+
+def create_circular_avatar(image_path, size=40):
+    pixmap = QPixmap(image_path)
+    if pixmap.isNull():
+        # Default avatar
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QBrush(QColor("#e0e0e0")))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(0, 0, size, size)
+        painter.setPen(QPen(QColor("#757575")))
+        font = painter.font()
+        font.setPixelSize(int(size * 0.5))
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "?")
+        painter.end()
+        return QIcon(pixmap)
+        
+    # Scale and crop to circle
+    pixmap = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    
+    # Create circular image
+    target = QPixmap(size, size)
+    target.fill(Qt.transparent)
+    
+    painter = QPainter(target)
+    painter.setRenderHint(QPainter.Antialiasing)
+    
+    path = QPainterPath()
+    path.addEllipse(0, 0, size, size)
+    painter.setClipPath(path)
+    
+    # Calculate offset to center the image
+    x_offset = (size - pixmap.width()) // 2
+    y_offset = (size - pixmap.height()) // 2
+    painter.drawPixmap(x_offset, y_offset, pixmap)
+    painter.end()
+    
+    return QIcon(target)
+
+class PhotoDropLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setAlignment(Qt.AlignCenter)
+        self.setText("Drag & Drop Photo Here\nor Click to Upload")
+        self.setStyleSheet("""
+            QLabel {
+                border: 2px dashed #aaaaaa;
+                border-radius: 8px;
+                background-color: #f9f9f9;
+                color: #777777;
+                padding: 10px;
+            }
+            QLabel:hover {
+                border-color: #1a73e8;
+                background-color: #f0f4ff;
+            }
+        """)
+        self.setMinimumSize(150, 150)
+        self.setMaximumSize(200, 200)
+        self.photo_path = None
+        self.pixmap_data = None
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and urls[0].isLocalFile():
+                ext = urls[0].toLocalFile().lower().split('.')[-1]
+                if ext in ['jpg', 'jpeg', 'png', 'webp']:
+                    event.acceptProposedAction()
+                    self.setStyleSheet("""
+                        QLabel {
+                            border: 2px dashed #1a73e8;
+                            border-radius: 8px;
+                            background-color: #e8f0fe;
+                            color: #1a73e8;
+                            padding: 10px;
+                        }
+                    """)
+                    return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet("""
+            QLabel {
+                border: 2px dashed #aaaaaa;
+                border-radius: 8px;
+                background-color: #f9f9f9;
+                color: #777777;
+                padding: 10px;
+            }
+            QLabel:hover {
+                border-color: #1a73e8;
+                background-color: #f0f4ff;
+            }
+        """)
+        event.accept()
+
+    def dropEvent(self, event: QDropEvent):
+        self.dragLeaveEvent(event) # Reset style
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile():
+            file_path = urls[0].toLocalFile()
+            self.load_image(file_path)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Customer Photo", "", "Images (*.jpg *.jpeg *.png *.webp)"
+            )
+            if file_path:
+                self.load_image(file_path)
+
+    def load_image(self, file_path):
+        # Check size (Max 5MB)
+        if os.path.getsize(file_path) > 5 * 1024 * 1024:
+            QMessageBox.warning(self, "File Too Large", "Image size must be less than 5 MB.")
+            return
+
+        pixmap = QPixmap(file_path)
+        if not pixmap.isNull():
+            self.photo_path = file_path
+            # Scale to fit label for preview
+            scaled_pixmap = pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.setPixmap(scaled_pixmap)
+            self.setText("")
+
+    def clear_image(self):
+        self.photo_path = None
+        self.clear()
+        self.setText("Drag & Drop Photo Here\nor Click to Upload")
+
+    def get_photo_path(self):
+        return self.photo_path
 
 class AddCustomerDialog(QDialog):
-    def __init__(self, next_cif, batches, parent=None):
+    def __init__(self, next_cif, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add New CIF (Customer)")
         self.setMinimumWidth(450)
         
-        layout = QFormLayout()
+        layout = QHBoxLayout()
+        
+        # Left side: Photo Upload
+        photo_layout = QVBoxLayout()
+        self.photo_label = PhotoDropLabel()
+        self.btn_remove_photo = QPushButton("Remove Photo")
+        self.btn_remove_photo.clicked.connect(self.photo_label.clear_image)
+        self.btn_remove_photo.setStyleSheet("background-color: #f44336; color: white;")
+        photo_layout.addWidget(QLabel("Profile Photo:"))
+        photo_layout.addWidget(self.photo_label)
+        photo_layout.addWidget(self.btn_remove_photo)
+        photo_layout.addStretch()
+        
+        # Right side: Form
+        form_layout = QFormLayout()
         
         self.cif_input = QLineEdit()
         self.cif_input.setText(next_cif)
         self.cif_input.setReadOnly(True)
         self.cif_input.setStyleSheet("background-color: #f0f0f0; color: #555;")
         
-        self.batch_combo = QComboBox()
-        for b in batches:
-            self.batch_combo.addItem(f"{b['name']} (₹{b['value']:,.0f})", b['id'])
-        
         self.name_input = QLineEdit()
+        self.surname_input = QLineEdit()
         self.phone_input = QLineEdit()
-        self.address_input = QLineEdit()
+        self.address_input = QTextEdit()
+        self.address_input.setFixedHeight(80) # Approximately 4 rows
         self.date_input = QDateEdit()
         self.date_input.setDate(QDate.currentDate())
         self.date_input.setCalendarPopup(True)
@@ -48,15 +221,15 @@ class AddCustomerDialog(QDialog):
         self.btn_upload_aadhar.clicked.connect(self.upload_document)
         self.lbl_image_status = QLabel("No file selected")
         
-        layout.addRow("CIF Number (Auto):", self.cif_input)
-        layout.addRow("Chit Batch:", self.batch_combo)
-        layout.addRow("Name:", self.name_input)
-        layout.addRow("Phone:", self.phone_input)
-        layout.addRow("Address:", self.address_input)
-        layout.addRow("Join Date:", self.date_input)
-        layout.addRow("Aadhar Number (Mandatory):", self.aadhar_input)
-        layout.addRow("Aadhar Card (PDF/Image):", self.btn_upload_aadhar)
-        layout.addRow("", self.lbl_image_status)
+        form_layout.addRow("CIF Number (Auto):", self.cif_input)
+        form_layout.addRow("Name:", self.name_input)
+        form_layout.addRow("Surname:", self.surname_input)
+        form_layout.addRow("Phone:", self.phone_input)
+        form_layout.addRow("Address:", self.address_input)
+        form_layout.addRow("Join Date:", self.date_input)
+        form_layout.addRow("Aadhar Number (Mandatory):", self.aadhar_input)
+        form_layout.addRow("Aadhar Card (PDF/Image):", self.btn_upload_aadhar)
+        form_layout.addRow("", self.lbl_image_status)
         
         btn_layout = QHBoxLayout()
         self.save_btn = QPushButton("Save")
@@ -67,7 +240,10 @@ class AddCustomerDialog(QDialog):
         btn_layout.addWidget(self.save_btn)
         btn_layout.addWidget(self.cancel_btn)
         
-        layout.addRow(btn_layout)
+        form_layout.addRow(btn_layout)
+        
+        layout.addLayout(photo_layout)
+        layout.addLayout(form_layout)
         self.setLayout(layout)
 
     def upload_document(self):
@@ -81,27 +257,31 @@ class AddCustomerDialog(QDialog):
         aadhar = self.aadhar_input.text().replace(" ", "")
         return {
             'cif': self.cif_input.text().strip(),
-            'batch_id': self.batch_combo.currentData(),
             'name': self.name_input.text().strip(),
+            'surname': self.surname_input.text().strip(),
             'phone': self.phone_input.text().strip(),
-            'address': self.address_input.text().strip(),
+            'address': self.address_input.toPlainText().strip(),
             'join_date': self.date_input.date().toString("yyyy-MM-dd"),
             'aadhar_number': aadhar,
-            'aadhar_image_path': self.aadhar_doc_path
+            'aadhar_image_path': self.aadhar_doc_path,
+            'photo_path': self.photo_label.get_photo_path()
         }
 
     def set_data(self, data):
-        self.cif_input.setText(data['cif'])
-        idx = self.batch_combo.findData(data['batch_id'])
-        if idx >= 0: self.batch_combo.setCurrentIndex(idx)
-        self.name_input.setText(data['name'])
-        self.phone_input.setText(data['phone'])
-        self.address_input.setText(data['address'])
+        self.cif_input.setText(data.get('cif', ''))
+        self.name_input.setText(data.get('name', ''))
+        self.surname_input.setText(data.get('surname', ''))
+        self.phone_input.setText(data.get('phone', ''))
+        self.address_input.setPlainText(data.get('address', ''))
         self.date_input.setDate(QDate.fromString(data['join_date'], "yyyy-MM-dd"))
         self.aadhar_input.setText(data['aadhar_number'])
-        self.aadhar_doc_path = data['aadhar_image_path']
+        self.aadhar_doc_path = data.get('aadhar_image_path', '')
         if self.aadhar_doc_path:
             self.lbl_image_status.setText(os.path.basename(self.aadhar_doc_path))
+            
+        photo_path = data.get('photo_path', '')
+        if photo_path and os.path.exists(photo_path):
+            self.photo_label.load_image(photo_path)
 
 class PaymentDialog(QDialog):
     def __init__(self, customer_id, current_month, due_amount, parent=None):
@@ -165,6 +345,11 @@ class CIFSelectorDialog(QDialog):
         self.setWindowTitle("Select Customer (CIF)")
         self.setMinimumSize(600, 400)
         self.multi_select = multi_select
+        self.offset = 0
+        self.limit = 10
+        self.loading = False
+        self.all_loaded = False
+        self.current_search = ""
         
         layout = QVBoxLayout(self)
         
@@ -190,6 +375,7 @@ class CIFSelectorDialog(QDialog):
             self.table.setSelectionMode(QTableWidget.SingleSelection)
             
         self.table.doubleClicked.connect(self.accept)
+        self.table.verticalScrollBar().valueChanged.connect(self.on_scroll)
         layout.addWidget(self.table)
         
         # Buttons
@@ -203,27 +389,69 @@ class CIFSelectorDialog(QDialog):
         btn_layout.addWidget(self.cancel_btn)
         layout.addLayout(btn_layout)
         
-        self.load_customers()
+        self.load_customers(reset=True)
+
+    def on_scroll(self, value):
+        if not self.loading and not self.all_loaded:
+            if value >= self.table.verticalScrollBar().maximum() - 2:
+                self.load_customers(reset=False)
         
-    def load_customers(self):
+    def load_customers(self, reset=True):
+        if self.loading: return
+        self.loading = True
+        
+        if reset:
+            self.offset = 0
+            self.table.setRowCount(0)
+            self.all_loaded = False
+        
         conn = scheme_db.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, cif_number, name, phone FROM customers WHERE status = 'Active'")
-        self.all_rows = cursor.fetchall()
-        conn.close()
-        self.display_rows(self.all_rows)
         
-    def display_rows(self, rows):
-        self.table.setRowCount(0)
+        query = "SELECT id, cif_number, name, phone FROM customers WHERE status = 'Active'"
+        params = []
+        if self.current_search:
+            query += " AND (cif_number LIKE ? OR name LIKE ? OR phone LIKE ?)"
+            p = f"%{self.current_search}%"
+            params.extend([p, p, p])
+        
+        query += " LIMIT ? OFFSET ?"
+        params.extend([self.limit, self.offset])
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        if not rows:
+            self.all_loaded = True
+        else:
+            self.display_rows(rows, append=not reset)
+            self.offset += len(rows)
+            
+            # If no scrollbar is visible yet, load more to fill the screen
+            QTimer.singleShot(100, self.check_more_needed)
+            
+        conn.close()
+        self.loading = False
+        
+    def check_more_needed(self):
+        if not self.all_loaded:
+            if self.table.verticalScrollBar().maximum() == 0:
+                self.load_customers(reset=False)
+        
+    def display_rows(self, rows, append=False):
+        if not append:
+            self.table.setRowCount(0)
+        
+        start_idx = self.table.rowCount()
         for r_idx, row in enumerate(rows):
-            self.table.insertRow(r_idx)
+            current_row = start_idx + r_idx
+            self.table.insertRow(current_row)
             for c_idx, val in enumerate(row):
-                self.table.setItem(r_idx, c_idx, QTableWidgetItem(str(val)))
+                self.table.setItem(current_row, c_idx, QTableWidgetItem(str(val)))
                 
     def filter_customers(self):
-        text = self.search_input.text().lower()
-        filtered = [r for r in self.all_rows if text in str(r[1]).lower() or text in r[2].lower() or text in str(r[3]).lower()]
-        self.display_rows(filtered)
+        self.current_search = self.search_input.text().strip()
+        self.load_customers(reset=True)
         
     def get_selected_customer(self):
         row = self.table.currentRow()
@@ -563,14 +791,22 @@ class CustomerLedgerDialog(QDialog):
         
         self.ledger_table = QTableWidget()
         self.ledger_table.setColumnCount(8)
-        self.ledger_table.setHorizontalHeaderLabels(["Month", "Due Amt", "Paid Amt", "Withdrawn", "Balance", "Date", "Receipt", "Status"])
+        self.ledger_table.setHorizontalHeaderLabels(["Due Date", "Due Amt", "Paid Amt", "Withdrawn", "Balance", "Date", "Receipt", "Status"])
         self.ledger_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.ledger_table)
         
-        self.btn_pay = QPushButton("Record Payment for Next Month")
+        btn_layout = QHBoxLayout()
+        self.btn_regenerate = QPushButton("Regenerate Due Dates")
+        self.btn_regenerate.setStyleSheet("background-color: #ff9800; color: white; padding: 10px; font-weight: bold;")
+        self.btn_regenerate.clicked.connect(self.regenerate_schedule)
+        
+        self.btn_pay = QPushButton("Record Payment for Next Due")
         self.btn_pay.setStyleSheet("background-color: #4caf50; color: white; padding: 10px; font-weight: bold;")
         self.btn_pay.clicked.connect(self.pay_next_month)
-        layout.addWidget(self.btn_pay)
+        
+        btn_layout.addWidget(self.btn_regenerate)
+        btn_layout.addWidget(self.btn_pay)
+        layout.addLayout(btn_layout)
         
         self.load_ledger_data()
 
@@ -597,7 +833,7 @@ class CustomerLedgerDialog(QDialog):
 
         # 2. Fetch ledger rows for THIS batch
         cursor.execute("""
-            SELECT month_number, due_amount, paid_amount, payment_date, receipt_number, status 
+            SELECT id, month_number, due_date, due_amount, paid_amount, payment_date, receipt_number, status 
             FROM customer_ledgers 
             WHERE customer_id = ? AND batch_id = ?
             ORDER BY month_number
@@ -610,7 +846,7 @@ class CustomerLedgerDialog(QDialog):
         running_balance = 0
         
         for r_idx, row in enumerate(rows):
-            month, due, paid, date, receipt, status = row
+            l_id, month, due_date_str, due, paid, date, receipt, status = row
             
             # Logic: Balance = Total Withdrawn - Total Paid
             current_withdrawn = w_amount if month == w_month else 0
@@ -619,9 +855,20 @@ class CustomerLedgerDialog(QDialog):
             
             self.ledger_table.insertRow(r_idx)
             
+            # Due Date DatePicker
+            date_widget = QDateEdit()
+            date_widget.setDisplayFormat("dd-MM-yyyy")
+            date_widget.setCalendarPopup(True)
+            if due_date_str:
+                date_widget.setDate(QDate.fromString(due_date_str, "yyyy-MM-dd"))
+            else:
+                date_widget.setDate(QDate.currentDate())
+            
+            date_widget.dateChanged.connect(lambda new_d, lid=l_id: self.update_due_date(lid, new_d))
+            self.ledger_table.setCellWidget(r_idx, 0, date_widget)
+            
             # Display Data
             display_data = [
-                month, 
                 f"₹{due:,.0f}", 
                 f"₹{paid:,.0f}" if paid else "-",
                 f"₹{current_withdrawn:,.0f}" if current_withdrawn > 0 else "-",
@@ -635,28 +882,69 @@ class CustomerLedgerDialog(QDialog):
                 item = QTableWidgetItem(str(val))
                 if status == 'Paid':
                     item.setBackground(QColor("#e8f5e9"))
-                if c_idx == 4: # Balance Column
+                    if c_idx == 0:  # Apply visual lock to date widget too
+                        date_widget.setEnabled(False)
+                        date_widget.setStyleSheet("color: #555; background-color: #e8f5e9;")
+                        
+                if c_idx == 3: # Balance Column (was 4, now shifted by 1 because col 0 is widget)
                     if running_balance > 0:
                         item.setForeground(QColor("#f44336")) # Red for Liability
                         item.setFont(QFont("Arial", weight=QFont.Bold))
                     elif running_balance < 0:
                         item.setForeground(QColor("#4caf50")) # Green for Surplus
                 
-                self.ledger_table.setItem(r_idx, c_idx, item)
+                # +1 because 0 is the widget
+                self.ledger_table.setItem(r_idx, c_idx + 1, item)
             
             # Track next pending month for payment button
             if status != 'Paid' and self.next_month_data is None:
-                self.next_month_data = (month, due)
+                self.next_month_data = (month, due, due_date_str)
 
         self.btn_pay.setEnabled(self.next_month_data is not None)
         if self.next_month_data:
-            self.btn_pay.setText(f"Record Payment: Month {self.next_month_data[0]} (₹{self.next_month_data[1]:,.0f})")
+            due_str = QDate.fromString(self.next_month_data[2], "yyyy-MM-dd").toString("dd-MM-yyyy") if self.next_month_data[2] else f"Month {self.next_month_data[0]}"
+            self.btn_pay.setText(f"Record Payment: Due on {due_str} (₹{self.next_month_data[1]:,.0f})")
         else:
             self.btn_pay.setText("Scheme Fully Paid")
 
+    def update_due_date(self, ledger_id, new_date):
+        conn = scheme_db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE customer_ledgers SET due_date = ? WHERE id = ?", (new_date.toString("yyyy-MM-dd"), ledger_id))
+        conn.commit()
+        conn.close()
+
+    def regenerate_schedule(self):
+        reply = QMessageBox.question(self, 'Regenerate Schedule', 
+            "This will recalculate all pending due dates based on the batch starting date. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            conn = scheme_db.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT starting_date FROM chit_batches WHERE id = ?", (self.batch_id,))
+            start_date_str = cursor.fetchone()[0]
+            
+            if not start_date_str:
+                QMessageBox.warning(self, "Error", "Batch does not have a starting date set.")
+                conn.close()
+                return
+                
+            cursor.execute("SELECT id, month_number, status FROM customer_ledgers WHERE customer_id = ? AND batch_id = ?", (self.customer_id, self.batch_id))
+            ledgers = cursor.fetchall()
+            for l_id, month, status in ledgers:
+                if status != 'Paid':
+                    new_date = calculate_due_date(start_date_str, month - 1)
+                    cursor.execute("UPDATE customer_ledgers SET due_date = ? WHERE id = ?", (new_date, l_id))
+            conn.commit()
+            conn.close()
+            self.load_ledger_data()
+            QMessageBox.information(self, "Success", "Pending due dates have been regenerated.")
+
     def pay_next_month(self):
         if self.next_month_data:
-            month, due = self.next_month_data
+            month, due, due_date_str = self.next_month_data
             # We call the parent's record_payment logic
             if hasattr(self.parent(), "record_payment"):
                 if self.parent().record_payment(self.customer_id, month, due, self.batch_id):
@@ -1150,9 +1438,15 @@ class SchemeFinanceApp(QMainWindow):
         # Initialize DB
         scheme_db.initialize_db()
         
+        # Pagination State for Customers
+        self.customer_offset = 0
+        self.customer_limit = 10
+        self.loading_customers = False
+        self.all_customers_loaded = False
+        
         self.setup_ui()
         self.load_dashboard_data()
-        self.load_customers()
+        self.load_customers(reset=True)
         self.load_scheme_master()
         
     def setup_ui(self):
@@ -1181,6 +1475,7 @@ class SchemeFinanceApp(QMainWindow):
         self.nav_list.addItem("Accounting")
         self.nav_list.addItem("Batches")
         self.nav_list.addItem("Scheme Config")
+        self.nav_list.addItem("Backup & Restore")
         
         self.nav_list.currentRowChanged.connect(self.change_page)
         sidebar_layout.addWidget(self.nav_list, 9) # Give 90% relative stretch to the list
@@ -1239,6 +1534,9 @@ class SchemeFinanceApp(QMainWindow):
         self.page_config = QWidget()
         self.setup_scheme_master_tab()
         
+        self.page_backup = QWidget()
+        self.setup_backup_restore_tab()
+        
         self.stacked_widget.addWidget(self.page_dashboard)    # 0
         self.stacked_widget.addWidget(self.page_customers)    # 1
         self.stacked_widget.addWidget(self.page_chit)         # 2
@@ -1247,6 +1545,7 @@ class SchemeFinanceApp(QMainWindow):
         self.stacked_widget.addWidget(self.page_accounting)   # 5
         self.stacked_widget.addWidget(self.page_batches)      # 6
         self.stacked_widget.addWidget(self.page_config)       # 7
+        self.stacked_widget.addWidget(self.page_backup)       # 8
         
         self.nav_list.setCurrentRow(0)
 
@@ -1465,7 +1764,7 @@ class SchemeFinanceApp(QMainWindow):
         self.btn_add_customer.clicked.connect(self.add_customer)
         
         self.btn_refresh_customers = QPushButton("Refresh")
-        self.btn_refresh_customers.clicked.connect(self.load_customers)
+        self.btn_refresh_customers.clicked.connect(lambda: self.load_customers(reset=True))
         
         btn_layout.addWidget(self.btn_add_customer)
         btn_layout.addWidget(self.btn_refresh_customers)
@@ -1473,9 +1772,13 @@ class SchemeFinanceApp(QMainWindow):
         layout.addLayout(btn_layout)
         
         self.customers_table = QTableWidget()
-        self.customers_table.setColumnCount(7)
-        self.customers_table.setHorizontalHeaderLabels(["ID", "CIF", "Name", "Aadhar", "Phone", "Status", "Actions"])
+        self.customers_table.setColumnCount(8)
+        self.customers_table.setHorizontalHeaderLabels(["ID", "Photo", "CIF", "Name", "Aadhar", "Phone", "Status", "Actions"])
         self.customers_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.customers_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.customers_table.setIconSize(QSize(40, 40))
+        self.customers_table.cellClicked.connect(self.on_customer_cell_clicked)
+        self.customers_table.verticalScrollBar().valueChanged.connect(self.on_customer_scroll)
         layout.addWidget(self.customers_table)
         
     def setup_chit_tab(self):
@@ -1664,9 +1967,11 @@ class SchemeFinanceApp(QMainWindow):
         conn = scheme_db.get_connection()
         cursor = conn.cursor()
         try:
-            # Get batch value
-            cursor.execute("SELECT chit_value FROM chit_batches WHERE id = ?", (batch_id,))
-            chit_value = cursor.fetchone()[0]
+            # Get batch value and starting date
+            cursor.execute("SELECT chit_value, starting_date FROM chit_batches WHERE id = ?", (batch_id,))
+            b_row = cursor.fetchone()
+            chit_value = b_row[0]
+            start_date_str = b_row[1] or ""
             
             # Get template for this value
             cursor.execute("SELECT month_number, payable_amount FROM scheme_master WHERE total_value = ? ORDER BY month_number", (chit_value,))
@@ -1677,10 +1982,11 @@ class SchemeFinanceApp(QMainWindow):
                 cursor.execute("SELECT COUNT(*) FROM customer_ledgers WHERE customer_id = ? AND batch_id = ?", (cid, batch_id))
                 if cursor.fetchone()[0] == 0:
                     for month, amount in template:
+                        due_date = calculate_due_date(start_date_str, month - 1)
                         cursor.execute("""
-                        INSERT INTO customer_ledgers (customer_id, batch_id, month_number, due_amount, status)
-                        VALUES (?, ?, ?, ?, 'Pending')
-                        """, (cid, batch_id, month, amount))
+                        INSERT INTO customer_ledgers (customer_id, batch_id, month_number, due_date, due_amount, status)
+                        VALUES (?, ?, ?, ?, ?, 'Pending')
+                        """, (cid, batch_id, month, due_date, amount))
             conn.commit()
         except Exception as e:
             print(f"Ledger Allocation Error: {e}")
@@ -1704,52 +2010,103 @@ class SchemeFinanceApp(QMainWindow):
             conn.close()
             return
 
-    def load_customers(self):
+    def on_customer_scroll(self, value):
+        if not self.loading_customers and not self.all_customers_loaded:
+            # Check if scrollbar is near the bottom
+            if value >= self.customers_table.verticalScrollBar().maximum() - 2:
+                self.load_customers(reset=False)
+
+    def load_customers(self, reset=True):
+        if self.loading_customers: return
+        self.loading_customers = True
+        
+        if reset:
+            self.customer_offset = 0
+            self.customers_table.setRowCount(0)
+            self.all_customers_loaded = False
+            
         conn = scheme_db.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, cif_number, name, aadhar_number, phone, status FROM customers")
+        cursor.execute("SELECT id, photo_path, cif_number, name, aadhar_number, phone, status FROM customers LIMIT ? OFFSET ?", 
+                       (self.customer_limit, self.customer_offset))
         rows = cursor.fetchall()
         
-        self.customers_table.setRowCount(0)
-        for row_idx, row_data in enumerate(rows):
-            self.customers_table.insertRow(row_idx)
-            for col_idx, item in enumerate(row_data):
-                self.customers_table.setItem(row_idx, col_idx, QTableWidgetItem(str(item)))
+        if not rows:
+            self.all_customers_loaded = True
+        else:
+            start_row = self.customers_table.rowCount()
+            for row_idx, row_data in enumerate(rows):
+                current_row = start_row + row_idx
+                self.customers_table.insertRow(current_row)
+                
+                self.customers_table.setItem(current_row, 0, QTableWidgetItem(str(row_data[0])))
+                
+                photo_item = QTableWidgetItem()
+                photo_item.setIcon(create_circular_avatar(row_data[1] if row_data[1] else "", 40))
+                photo_item.setData(Qt.UserRole, row_data[1] if row_data[1] else "")
+                self.customers_table.setItem(current_row, 1, photo_item)
+                
+                self.customers_table.setItem(current_row, 2, QTableWidgetItem(str(row_data[2])))
+                self.customers_table.setItem(current_row, 3, QTableWidgetItem(str(row_data[3])))
+                self.customers_table.setItem(current_row, 4, QTableWidgetItem(str(row_data[4])))
+                self.customers_table.setItem(current_row, 5, QTableWidgetItem(str(row_data[5])))
+                self.customers_table.setItem(current_row, 6, QTableWidgetItem(str(row_data[6])))
+                
+                # Actions Column
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(0,0,0,0)
+                
+                btn_view = QPushButton("View")
+                btn_view.setStyleSheet("background-color: #2196f3; color: white; padding: 4px 8px;")
+                btn_view.clicked.connect(lambda _, cid=row_data[0]: self.view_customer(cid))
+                
+                btn_edit = QPushButton("Edit")
+                btn_edit.setStyleSheet("padding: 4px 8px;")
+                btn_edit.clicked.connect(lambda _, cid=row_data[0]: self.edit_customer(cid))
+                
+                btn_delete = QPushButton("Delete")
+                btn_delete.clicked.connect(lambda _, cid=row_data[0]: self.delete_customer(cid))
+                btn_delete.setStyleSheet("background-color: #f44336; color: white; padding: 4px 8px;")
+                
+                action_layout.addWidget(btn_view)
+                action_layout.addWidget(btn_edit)
+                action_layout.addWidget(btn_delete)
+                self.customers_table.setCellWidget(current_row, 7, action_widget)
             
-            # Actions Column
-            action_widget = QWidget()
-            action_layout = QHBoxLayout(action_widget)
-            action_layout.setContentsMargins(0,0,0,0)
+            self.customer_offset += len(rows)
             
-            btn_edit = QPushButton("Edit")
-            btn_edit.setStyleSheet("padding: 4px 8px;")
-            btn_edit.clicked.connect(lambda _, cid=row_data[0]: self.edit_customer(cid))
-            
-            btn_delete = QPushButton("Delete")
-            btn_delete.clicked.connect(lambda _, cid=row_data[0]: self.delete_customer(cid))
-            btn_delete.setStyleSheet("background-color: #f44336; color: white; padding: 4px 8px;")
-            
-            action_layout.addWidget(btn_edit)
-            action_layout.addWidget(btn_delete)
-            self.customers_table.setCellWidget(row_idx, 6, action_widget)
+            # If no scrollbar is visible yet, load more to fill the screen
+            QTimer.singleShot(100, self.check_more_customers_needed)
             
         conn.close()
+        self.loading_customers = False
+
+    def on_customer_cell_clicked(self, row, column):
+        if column == 1: # Photo column
+            item = self.customers_table.item(row, column)
+            if item:
+                photo_path = item.data(Qt.UserRole)
+                if photo_path and os.path.exists(photo_path):
+                    dialog = QDialog(self)
+                    dialog.setWindowTitle("Customer Photo Preview")
+                    layout = QVBoxLayout(dialog)
+                    label = QLabel()
+                    pixmap = QPixmap(photo_path)
+                    if not pixmap.isNull():
+                        label.setPixmap(pixmap.scaled(600, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    layout.addWidget(label)
+                    dialog.exec_()
+
+    def check_more_customers_needed(self):
+        if not self.all_customers_loaded:
+            if self.customers_table.verticalScrollBar().maximum() == 0:
+                self.load_customers(reset=False)
 
     def add_customer(self):
         next_cif = self.get_next_cif_number()
         
-        # Get active batches for selection
-        conn = scheme_db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, batch_name, chit_value FROM chit_batches WHERE status = 'Active'")
-        batches = [{'id': r[0], 'name': r[1], 'value': r[2]} for r in cursor.fetchall()]
-        conn.close()
-        
-        if not batches:
-            QMessageBox.warning(self, "No Batches", "Please create at least one Chit Batch first.")
-            return
-
-        dialog = AddCustomerDialog(next_cif, batches, self)
+        dialog = AddCustomerDialog(next_cif, self)
         if dialog.exec_() == QDialog.Accepted:
             data = dialog.get_data()
             if not data['cif'] or not data['name'] or len(data['aadhar_number']) < 12:
@@ -1769,32 +2126,36 @@ class SchemeFinanceApp(QMainWindow):
                     shutil.copy2(data['aadhar_image_path'], final_image_path)
                 except Exception as e:
                     QMessageBox.warning(self, "File Error", f"Could not save document: {e}")
+                    
+            final_photo_path = ""
+            if data.get('photo_path') and os.path.exists(data['photo_path']):
+                if not os.path.exists("uploads/customers"):
+                    os.makedirs("uploads/customers")
+                
+                ext = os.path.splitext(data['photo_path'])[1].lower()
+                timestamp = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+                filename = f"customer_{data['cif']}_{timestamp}{ext}"
+                final_photo_path = os.path.join("uploads/customers", filename)
+                
+                pixmap = QPixmap(data['photo_path'])
+                if not pixmap.isNull():
+                    scaled_pixmap = pixmap.scaled(500, 500, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    fmt = ext.replace('.', '').upper()
+                    if fmt == 'JPG': fmt = 'JPEG'
+                    scaled_pixmap.save(final_photo_path, fmt, 80)
             
             conn = scheme_db.get_connection()
             cursor = conn.cursor()
             try:
                 # 1. Insert/Update CIF
                 cursor.execute("""
-                INSERT OR IGNORE INTO customers (cif_number, name, phone, address, join_date, aadhar_number, aadhar_image_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (data['cif'], data['name'], data['phone'], data['address'], data['join_date'], data['aadhar_number'], final_image_path))
-                
-                cursor.execute("SELECT id FROM customers WHERE cif_number = ?", (data['cif'],))
-                cid = cursor.fetchone()[0]
-
-                # 2. Add Enrollment
-                cursor.execute("""
-                INSERT OR IGNORE INTO batch_enrollments (customer_id, batch_id, join_date)
-                VALUES (?, ?, ?)
-                """, (cid, data['batch_id'], data['join_date']))
+                INSERT OR IGNORE INTO customers (cif_number, name, surname, phone, address, join_date, aadhar_number, aadhar_image_path, photo_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (data['cif'], data['name'], data['surname'], data['phone'], data['address'], data['join_date'], data['aadhar_number'], final_image_path, final_photo_path))
                 
                 conn.commit()
                 
-                # 3. Allocate Ledger
-                self.allocate_batch_ledgers(data['batch_id'], [cid])
-                
                 self.load_customers()
-                self.load_chit_data()
                 self.load_dashboard_data()
             except Exception as e:
                 conn.rollback()
@@ -1817,24 +2178,147 @@ class SchemeFinanceApp(QMainWindow):
                 return "1000"
         return "1000"
 
+    def view_customer(self, customer_id):
+        conn = scheme_db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, cif_number, name, surname, phone, address, join_date, aadhar_number, aadhar_image_path, photo_path, status, created_at FROM customers WHERE id = ?", (customer_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Customer Details - {row[2]}")
+            dialog.resize(600, 500)
+            layout = QVBoxLayout(dialog)
+            
+            browser = QTextBrowser()
+            layout.addWidget(browser)
+            
+            photo_path = row[9]
+            photo_html = ""
+            if photo_path and os.path.exists(photo_path):
+                # Convert backslashes to forward slashes for HTML
+                photo_url = QUrl.fromLocalFile(os.path.abspath(photo_path)).toString()
+                photo_html = f'<img src="{photo_url}" width="150" height="150" style="float: right; border-radius: 8px; object-fit: cover; border: 2px solid #ccc;">'
+            
+            html_content = f"""
+            <html>
+            <head>
+            <style>
+                body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 10px; color: #333; }}
+                .container {{ position: relative; }}
+                h2 {{ margin-top: 0; color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 5px; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+                th, td {{ padding: 10px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }}
+                th {{ width: 35%; color: #555; font-weight: bold; background-color: #f9f9f9; }}
+                td {{ font-size: 14px; }}
+                .badge {{ display: inline-block; padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; color: white; }}
+                .badge-active {{ background-color: #4caf50; }}
+                .badge-inactive {{ background-color: #f44336; }}
+                .print-btn {{
+                    background-color: #4caf50;
+                    color: white;
+                    padding: 10px 20px;
+                    border: none;
+                    border-radius: 4px;
+                    font-size: 14px;
+                    font-weight: bold;
+                    cursor: pointer;
+                    margin-bottom: 15px;
+                }}
+                .print-btn:hover {{ background-color: #45a049; }}
+                @media print {{
+                    .no-print {{ display: none !important; }}
+                    body {{ padding: 0; }}
+                }}
+            </style>
+            </head>
+            <body>
+                <div class="no-print" style="text-align: right;">
+                    <button class="print-btn" onclick="window.print()">🖨️ Print Profile</button>
+                </div>
+                <div class="container">
+                    {photo_html}
+                    <h2>{row[2]} {row[3] if row[3] else ''}</h2>
+                    <p style="color: #666; font-size: 14px; margin-bottom: 20px;">
+                        <b>CIF Number:</b> {row[1]}<br>
+                        <b>ID:</b> {row[0]}
+                    </p>
+                    
+                    <div style="clear: both;"></div>
+                    
+                    <table>
+                        <tr><th>Status</th><td><span class="badge {'badge-active' if row[10] == 'Active' else 'badge-inactive'}">{row[10]}</span></td></tr>
+                        <tr><th>Phone Number</th><td>{row[4]}</td></tr>
+                        <tr><th>Address</th><td>{row[5] if row[5] else 'N/A'}</td></tr>
+                        <tr><th>Join Date</th><td>{row[6]}</td></tr>
+                        <tr><th>Aadhar Number</th><td>{row[7]}</td></tr>
+                        <tr><th>Profile Created At</th><td>{row[11]}</td></tr>
+                    </table>
+                </div>
+            </body>
+            </html>
+            """
+            browser.setHtml(html_content)
+            
+            def do_print_preview():
+                import tempfile
+                import webbrowser
+                import os
+                
+                temp_dir = tempfile.gettempdir()
+                file_path = os.path.join(temp_dir, f"customer_preview_{row[0]}.html")
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+                
+                # Use file:// with forward slashes for better cross-platform browser support
+                file_uri = 'file:///' + os.path.abspath(file_path).replace('\\', '/')
+                webbrowser.open(file_uri)
+
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            
+            print_btn = QPushButton("Print Preview")
+            print_btn.clicked.connect(do_print_preview)
+            print_btn.setStyleSheet("padding: 8px 24px; background-color: #4caf50; color: white; border: none; border-radius: 4px; font-weight: bold;")
+            
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            close_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #dc3545;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    font-weight: bold;
+                    padding: 8px 18px;
+                }
+                QPushButton:hover {
+                    background-color: #b52a37;
+                }
+            """)
+            close_btn.setCursor(Qt.PointingHandCursor)
+            
+            btn_layout.addWidget(print_btn)
+            btn_layout.addWidget(close_btn)
+            layout.addLayout(btn_layout)
+            
+            dialog.exec_()
+
     def edit_customer(self, customer_id):
         conn = scheme_db.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT cif_number, name, phone, address, join_date, aadhar_number, aadhar_image_path, batch_id FROM customers WHERE id = ?", (customer_id,))
+        cursor.execute("SELECT cif_number, name, surname, phone, address, join_date, aadhar_number, aadhar_image_path, photo_path FROM customers WHERE id = ?", (customer_id,))
         row = cursor.fetchone()
         
-        # Get batches for selection
-        cursor.execute("SELECT id, batch_name, chit_value FROM chit_batches WHERE status = 'Active'")
-        batches = [{'id': r[0], 'name': r[1], 'value': r[2]} for r in cursor.fetchall()]
         conn.close()
         
         if row:
             data = {
-                'cif': row[0], 'name': row[1], 'phone': row[2], 'address': row[3],
-                'join_date': row[4], 'aadhar_number': row[5], 'aadhar_image_path': row[6],
-                'batch_id': row[7]
+                'cif': row[0], 'name': row[1], 'surname': row[2], 'phone': row[3], 'address': row[4],
+                'join_date': row[5], 'aadhar_number': row[6], 'aadhar_image_path': row[7], 'photo_path': row[8]
             }
-            dialog = AddCustomerDialog(data['cif'], batches, self)
+            dialog = AddCustomerDialog(data['cif'], self)
             dialog.setWindowTitle("Edit CIF (Customer)")
             dialog.set_data(data)
             
@@ -1854,15 +2338,33 @@ class SchemeFinanceApp(QMainWindow):
                         final_path = new_final_path
                     except Exception as e:
                         QMessageBox.warning(self, "File Error", f"Could not save document: {e}")
+                        
+                final_photo_path = new_data.get('photo_path', '')
+                if final_photo_path and not final_photo_path.startswith("uploads/customers") and not final_photo_path.startswith("uploads\\customers"):
+                    if not os.path.exists("uploads/customers"):
+                        os.makedirs("uploads/customers")
+                        
+                    ext = os.path.splitext(final_photo_path)[1].lower()
+                    timestamp = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss")
+                    filename = f"customer_{new_data['cif']}_{timestamp}{ext}"
+                    new_final_photo_path = os.path.join("uploads/customers", filename)
+                    
+                    pixmap = QPixmap(final_photo_path)
+                    if not pixmap.isNull():
+                        scaled_pixmap = pixmap.scaled(500, 500, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        fmt = ext.replace('.', '').upper()
+                        if fmt == 'JPG': fmt = 'JPEG'
+                        scaled_pixmap.save(new_final_photo_path, fmt, 80)
+                        final_photo_path = new_final_photo_path
                 
                 conn = scheme_db.get_connection()
                 cursor = conn.cursor()
                 try:
                     cursor.execute("""
                     UPDATE customers 
-                    SET name=?, phone=?, address=?, join_date=?, aadhar_number=?, aadhar_image_path=?, batch_id=?
+                    SET name=?, surname=?, phone=?, address=?, join_date=?, aadhar_number=?, aadhar_image_path=?, photo_path=?
                     WHERE id=?
-                    """, (new_data['name'], new_data['phone'], new_data['address'], new_data['join_date'], new_data['aadhar_number'], final_path, new_data['batch_id'], customer_id))
+                    """, (new_data['name'], new_data['surname'], new_data['phone'], new_data['address'], new_data['join_date'], new_data['aadhar_number'], final_path, final_photo_path, customer_id))
                     conn.commit()
                     self.load_customers()
                     self.load_chit_data()
@@ -2612,6 +3114,213 @@ class SchemeFinanceApp(QMainWindow):
                 self.load_transactions()
             finally:
                 conn.close()
+
+    # --- Backup & Restore Methods ---
+    def setup_backup_restore_tab(self):
+        layout = QVBoxLayout(self.page_backup)
+        
+        # Email Settings Group
+        settings_frame = QFrame()
+        settings_frame.setStyleSheet("background-color: white; border-radius: 8px;")
+        settings_layout = QFormLayout(settings_frame)
+        settings_layout.setContentsMargins(15, 15, 15, 15)
+        
+        lbl_title = QLabel("Email Settings for Backup")
+        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #333;")
+        settings_layout.addRow(lbl_title)
+        
+        self.email_sender_input = QLineEdit()
+        self.email_sender_input.setPlaceholderText("sender@gmail.com")
+        self.email_password_input = QLineEdit()
+        self.email_password_input.setEchoMode(QLineEdit.Password)
+        self.email_password_input.setPlaceholderText("App Password")
+        self.email_receiver_input = QLineEdit()
+        self.email_receiver_input.setPlaceholderText("receiver@gmail.com")
+        self.smtp_server_input = QLineEdit()
+        self.smtp_server_input.setText("smtp.gmail.com")
+        self.smtp_port_input = QLineEdit()
+        self.smtp_port_input.setText("465")
+        
+        settings_layout.addRow("Sender Email:", self.email_sender_input)
+        settings_layout.addRow("App Password:", self.email_password_input)
+        settings_layout.addRow("Receiver Email:", self.email_receiver_input)
+        settings_layout.addRow("SMTP Server:", self.smtp_server_input)
+        settings_layout.addRow("SMTP Port:", self.smtp_port_input)
+        
+        self.btn_save_email = QPushButton("Save Settings")
+        self.btn_save_email.setFixedWidth(150)
+        self.btn_save_email.clicked.connect(self.save_email_config)
+        self.btn_save_email.setStyleSheet("padding: 8px; background-color: #2196f3; color: white; border-radius: 4px; font-weight: bold;")
+        settings_layout.addRow("", self.btn_save_email)
+        
+        layout.addWidget(settings_frame)
+        
+        # Actions Group
+        actions_layout = QHBoxLayout()
+        self.btn_backup = QPushButton("Backup & Send Mail")
+        self.btn_backup.setStyleSheet("padding: 15px; background-color: #4caf50; color: white; border-radius: 6px; font-weight: bold; font-size: 14px;")
+        self.btn_backup.clicked.connect(self.run_backup)
+        
+        self.btn_restore = QPushButton("Restore Backup")
+        self.btn_restore.setStyleSheet("padding: 15px; background-color: #f44336; color: white; border-radius: 6px; font-weight: bold; font-size: 14px;")
+        self.btn_restore.clicked.connect(self.run_restore)
+        
+        actions_layout.addWidget(self.btn_backup)
+        actions_layout.addWidget(self.btn_restore)
+        layout.addLayout(actions_layout)
+        
+        # Status Label
+        self.backup_status_label = QLabel("")
+        self.backup_status_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.backup_status_label)
+        
+        # History Table
+        history_lbl = QLabel("Backup History (Local)")
+        history_lbl.setStyleSheet("font-size: 14px; font-weight: bold; margin-top: 10px;")
+        layout.addWidget(history_lbl)
+        
+        self.backup_history_table = QTableWidget()
+        self.backup_history_table.setColumnCount(4)
+        self.backup_history_table.setHorizontalHeaderLabels(["File Name", "Date", "Size (KB)", "Status"])
+        self.backup_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.backup_history_table)
+        
+        self.load_email_config()
+        self.load_backup_history()
+
+    def load_email_config(self):
+        config_path = "config.json"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                    self.email_sender_input.setText(config.get("sender_email", ""))
+                    # Simple obfuscation decode
+                    import base64
+                    encoded_pwd = config.get("app_password", "")
+                    if encoded_pwd:
+                        try:
+                            self.email_password_input.setText(base64.b64decode(encoded_pwd).decode('utf-8'))
+                        except:
+                            self.email_password_input.setText(encoded_pwd)
+                    self.email_receiver_input.setText(config.get("receiver_email", ""))
+                    self.smtp_server_input.setText(config.get("smtp_server", "smtp.gmail.com"))
+                    self.smtp_port_input.setText(config.get("smtp_port", "465"))
+            except Exception as e:
+                print(f"Error loading config: {e}")
+
+    def save_email_config(self):
+        import base64
+        config = {
+            "sender_email": self.email_sender_input.text().strip(),
+            "app_password": base64.b64encode(self.email_password_input.text().encode('utf-8')).decode('utf-8'),
+            "receiver_email": self.email_receiver_input.text().strip(),
+            "smtp_server": self.smtp_server_input.text().strip(),
+            "smtp_port": self.smtp_port_input.text().strip()
+        }
+        with open("config.json", "w") as f:
+            json.dump(config, f)
+        QMessageBox.information(self, "Success", "Email settings saved securely.")
+
+    def run_backup(self):
+        self.save_email_config() # Auto save before run
+        config_path = "config.json"
+        config = {}
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config = json.load(f)
+                import base64
+                if config.get("app_password"):
+                    try:
+                        config["app_password"] = base64.b64decode(config["app_password"]).decode('utf-8')
+                    except:
+                        pass
+                        
+        self.btn_backup.setEnabled(False)
+        self.backup_status_label.setText("Starting backup...")
+        
+        self.backup_worker = backup_restore.BackupWorker("scheme_finance.db", "backups", config)
+        self.backup_worker.progress.connect(self.on_backup_progress)
+        self.backup_worker.success.connect(self.on_backup_success)
+        self.backup_worker.error.connect(self.on_backup_error)
+        self.backup_worker.start()
+
+    def on_backup_progress(self, msg):
+        self.backup_status_label.setText(msg)
+
+    def on_backup_success(self, msg):
+        self.backup_status_label.setText("")
+        self.btn_backup.setEnabled(True)
+        QMessageBox.information(self, "Backup Complete", msg)
+        self.load_backup_history()
+
+    def on_backup_error(self, msg):
+        self.backup_status_label.setText("")
+        self.btn_backup.setEnabled(True)
+        QMessageBox.critical(self, "Backup Error", msg)
+        self.load_backup_history()
+
+    def run_restore(self):
+        reply = QMessageBox.question(self, 'Confirm Restore', 
+                                     "Current database will be replaced. A safety backup will be created.\\nDo you want to continue?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Backup File", "backups", "Backup Files (*.db *.zip)")
+        if not file_path:
+            return
+
+        self.btn_restore.setEnabled(False)
+        self.backup_status_label.setText("Restoring database...")
+        
+        self.restore_worker = backup_restore.RestoreWorker(file_path, "scheme_finance.db")
+        self.restore_worker.progress.connect(self.on_backup_progress)
+        self.restore_worker.success.connect(self.on_restore_success)
+        self.restore_worker.error.connect(self.on_backup_error) # reuse error handler
+        self.restore_worker.start()
+
+    def on_restore_success(self, msg):
+        self.backup_status_label.setText("")
+        self.btn_restore.setEnabled(True)
+        QMessageBox.information(self, "Restore Complete", msg)
+        self.reload_all_data()
+
+    def reload_all_data(self):
+        try:
+            self.load_dashboard_data()
+            self.load_customers()
+            self.load_chit_data()
+            self.load_shg_data()
+            self.load_individual_data()
+            self.load_batches()
+            self.load_accounts()
+        except Exception as e:
+            QMessageBox.warning(self, "Reload Error", f"Data reloaded with some errors: {e}")
+
+    def load_backup_history(self):
+        self.backup_history_table.setRowCount(0)
+        backup_dir = "backups"
+        if not os.path.exists(backup_dir):
+            return
+            
+        files = []
+        for f in os.listdir(backup_dir):
+            if f.endswith(".db") or f.endswith(".zip"):
+                path = os.path.join(backup_dir, f)
+                stat = os.stat(path)
+                size_kb = stat.st_size / 1024
+                date_str = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                files.append((f, date_str, size_kb, "Available"))
+                
+        files.sort(key=lambda x: x[1], reverse=True) # Sort newest first
+        
+        for r_idx, (fname, fdate, fsize, fstatus) in enumerate(files):
+            self.backup_history_table.insertRow(r_idx)
+            self.backup_history_table.setItem(r_idx, 0, QTableWidgetItem(fname))
+            self.backup_history_table.setItem(r_idx, 1, QTableWidgetItem(fdate))
+            self.backup_history_table.setItem(r_idx, 2, QTableWidgetItem(f"{fsize:.1f}"))
+            self.backup_history_table.setItem(r_idx, 3, QTableWidgetItem(fstatus))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
